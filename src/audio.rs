@@ -1,10 +1,11 @@
 use cpal::{
-    traits::{DeviceTrait, HostTrait, StreamTrait}, Device, SampleFormat, SizedSample, Stream, StreamConfig
+    Device, SampleFormat, SizedSample, Stream, StreamConfig,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use dasp_sample::Duplex;
-use fundsp::hacker::{AudioUnit, adsr_live, sine, var};
+use fundsp::hacker::{AudioUnit, adsr_live, lowpass_hz, saw, square, triangle, var};
 
-use crate::{sample_tracker::SampleTracker, SharedControls};
+use crate::{SharedControls, sample_tracker::SampleTracker};
 
 /// Defines that actual synth that is controlled by the shared MIDI controls.
 pub fn create_sound(
@@ -16,8 +17,20 @@ pub fn create_sound(
     }: SharedControls,
 ) -> Box<dyn AudioUnit> {
     Box::new(
-        var(&pitch_bend) * var(&pitch)
-            >> sine() * (var(&control) >> adsr_live(0.1, 0.2, 0.4, 0.2)) * var(&volume),
+        // Layer 1: Slightly detuned saw waves for thickness
+        (var(&pitch_bend) * var(&pitch) * 1.0 >> saw())
+        + (var(&pitch_bend) * var(&pitch) * 1.003 >> saw())  // +5 cents
+        + (var(&pitch_bend) * var(&pitch) * 0.997 >> saw())  // -5 cents
+        // Layer 2: Sub oscillator one octave down
+        + (var(&pitch_bend) * var(&pitch) * 0.5 >> triangle()) * 0.5
+        // Layer 3: Fifth above for harmonic richness
+        + (var(&pitch_bend) * var(&pitch) * 1.5 >> square()) * 0.2
+        // Mix and filter
+        >> lowpass_hz(2000.0, 0.7)  // Warm it up with a lowpass
+        // Envelope and output
+        * (var(&control) >> adsr_live(0.05, 0.3, 0.6, 0.4))
+        * var(&volume)
+        * 0.3, // Prevent clipping from summed oscillators
     )
 }
 
@@ -55,15 +68,14 @@ fn run_synth<T: SizedSample + Duplex<f64>>(
     let mut next_value = move || sound.get_stereo();
     let channels = config.channels as usize;
     let err_fn = |err| tracing::error!(?err, "Error on audio stream");
-    let stream = device
-        .build_output_stream(
-            &config,
-            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                write_data(data, channels, &mut next_value, sample_tracker.clone())
-            },
-            err_fn,
-            None,
-        )?;
+    let stream = device.build_output_stream(
+        &config,
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            write_data(data, channels, &mut next_value, sample_tracker.clone())
+        },
+        err_fn,
+        None,
+    )?;
 
     stream.play()?;
 
